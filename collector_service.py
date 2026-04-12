@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -13,27 +14,70 @@ import uvicorn
 from fastapi import FastAPI
 
 # --- make project root importable ---
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from services.memory_store import SnapshotStore
+try:
+    from services.memory_store import SnapshotStore
+except Exception:
+    from collections import deque
+    from threading import Lock
+    import copy
+
+    class SnapshotStore:
+        def __init__(self, max_snapshots: int = 100) -> None:
+            self._lock = Lock()
+            self._max_snapshots = max_snapshots
+            self._store: dict[str, deque[dict[str, Any]]] = {
+                "NIFTY": deque(maxlen=max_snapshots),
+                "SENSEX": deque(maxlen=max_snapshots),
+            }
+
+        def append(self, symbol: str, snapshot: dict[str, Any]) -> None:
+            with self._lock:
+                if symbol not in self._store:
+                    self._store[symbol] = deque(maxlen=self._max_snapshots)
+                self._store[symbol].append(copy.deepcopy(snapshot))
+
+        def latest(self, symbol: str) -> dict[str, Any]:
+            with self._lock:
+                bucket = self._store.get(symbol)
+                if not bucket or len(bucket) == 0:
+                    return {}
+                return copy.deepcopy(bucket[-1])
+
+        def snapshots(self, symbol: str) -> list[dict[str, Any]]:
+            with self._lock:
+                bucket = self._store.get(symbol)
+                if not bucket:
+                    return []
+                return copy.deepcopy(list(bucket))
+
+        def count(self, symbol: str) -> int:
+            with self._lock:
+                bucket = self._store.get(symbol)
+                return len(bucket) if bucket else 0
+
+        def symbols(self) -> list[str]:
+            with self._lock:
+                return list(self._store.keys())
 
 
 BASE_URL = "https://api.upstox.com/v2"
 TOKEN_STORE_FILE = PROJECT_ROOT / "token_store.json"
 HTTP_TIMEOUT = 20
-REFRESH_SECONDS = 2
+REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "2"))
 
 SYMBOL_CONFIG = {
     "NIFTY": {
-        "instrument": "NSE_INDEX|Nifty 50",
-        "expiry": "2026-04-13",
+        "instrument": os.getenv("NIFTY_INSTRUMENT", "NSE_INDEX|Nifty 50"),
+        "expiry": os.getenv("NIFTY_EXPIRY", "2026-04-13"),
         "table": "nifty_option_chain",
     },
     "SENSEX": {
-        "instrument": "BSE_INDEX|SENSEX",
-        "expiry": "2026-04-16",
+        "instrument": os.getenv("SENSEX_INSTRUMENT", "BSE_INDEX|SENSEX"),
+        "expiry": os.getenv("SENSEX_EXPIRY", "2026-04-16"),
         "table": "sensex_option_chain",
     },
 }
@@ -43,9 +87,14 @@ app = FastAPI(title="Option Chain Collector Service")
 
 
 def _load_access_token() -> str:
+    access_token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
+    if access_token:
+        return access_token
+
     if not TOKEN_STORE_FILE.exists():
         raise FileNotFoundError(
-            f"Token file not found: {TOKEN_STORE_FILE}. Please login first."
+            f"Token file not found: {TOKEN_STORE_FILE}. "
+            "Set UPSTOX_ACCESS_TOKEN or provide token_store.json."
         )
 
     with TOKEN_STORE_FILE.open("r", encoding="utf-8") as f:
@@ -310,24 +359,47 @@ def startup_event() -> None:
         thread.start()
 
 
+@app.get("/")
+def root() -> dict[str, Any]:
+    return {
+        "message": "Trading Backend Running",
+        "health_url": "/health",
+        "latest_nifty_url": "/latest/NIFTY",
+        "latest_sensex_url": "/latest/SENSEX",
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
+    nifty_latest = store.latest("NIFTY")
+    sensex_latest = store.latest("SENSEX")
+
     return {
         "ok": True,
         "symbols": store.symbols(),
         "nifty_count": store.count("NIFTY"),
         "sensex_count": store.count("SENSEX"),
+        "nifty_latest_ts": nifty_latest.get("timestamp"),
+        "sensex_latest_ts": sensex_latest.get("timestamp"),
+        "nifty_error": nifty_latest.get("fetch_error"),
+        "sensex_error": sensex_latest.get("fetch_error"),
+        "token_present": bool(os.getenv("UPSTOX_ACCESS_TOKEN", "").strip() or TOKEN_STORE_FILE.exists()),
     }
 
 
 @app.get("/latest/{symbol}")
 def latest(symbol: str) -> dict[str, Any]:
-    return store.latest(symbol.upper())
+    symbol = symbol.upper()
+    if symbol not in ("NIFTY", "SENSEX"):
+        return {"error": f"Unsupported symbol: {symbol}"}
+    return store.latest(symbol)
 
 
 @app.get("/snapshots/{symbol}")
 def snapshots(symbol: str) -> dict[str, Any]:
     symbol = symbol.upper()
+    if symbol not in ("NIFTY", "SENSEX"):
+        return {"error": f"Unsupported symbol: {symbol}"}
     return {
         "symbol": symbol,
         "count": store.count(symbol),
@@ -336,4 +408,5 @@ def snapshots(symbol: str) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8765)
+    port = int(os.getenv("PORT", "8765"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
