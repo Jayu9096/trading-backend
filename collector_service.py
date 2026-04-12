@@ -13,55 +13,11 @@ import requests
 import uvicorn
 from fastapi import FastAPI
 
-# --- make project root importable ---
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-try:
-    from services.memory_store import SnapshotStore
-except Exception:
-    from collections import deque
-    from threading import Lock
-    import copy
-
-    class SnapshotStore:
-        def __init__(self, max_snapshots: int = 100) -> None:
-            self._lock = Lock()
-            self._max_snapshots = max_snapshots
-            self._store: dict[str, deque[dict[str, Any]]] = {
-                "NIFTY": deque(maxlen=max_snapshots),
-                "SENSEX": deque(maxlen=max_snapshots),
-            }
-
-        def append(self, symbol: str, snapshot: dict[str, Any]) -> None:
-            with self._lock:
-                if symbol not in self._store:
-                    self._store[symbol] = deque(maxlen=self._max_snapshots)
-                self._store[symbol].append(copy.deepcopy(snapshot))
-
-        def latest(self, symbol: str) -> dict[str, Any]:
-            with self._lock:
-                bucket = self._store.get(symbol)
-                if not bucket or len(bucket) == 0:
-                    return {}
-                return copy.deepcopy(bucket[-1])
-
-        def snapshots(self, symbol: str) -> list[dict[str, Any]]:
-            with self._lock:
-                bucket = self._store.get(symbol)
-                if not bucket:
-                    return []
-                return copy.deepcopy(list(bucket))
-
-        def count(self, symbol: str) -> int:
-            with self._lock:
-                bucket = self._store.get(symbol)
-                return len(bucket) if bucket else 0
-
-        def symbols(self) -> list[str]:
-            with self._lock:
-                return list(self._store.keys())
+from services.memory_store import SnapshotStore
 
 
 BASE_URL = "https://api.upstox.com/v2"
@@ -87,24 +43,26 @@ app = FastAPI(title="Option Chain Collector Service")
 
 
 def _load_access_token() -> str:
-    access_token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
-    if access_token:
-        return access_token
+    env_token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
+    if env_token:
+        return env_token
 
-    if not TOKEN_STORE_FILE.exists():
-        raise FileNotFoundError(
-            f"Token file not found: {TOKEN_STORE_FILE}. "
-            "Set UPSTOX_ACCESS_TOKEN or provide token_store.json."
+    if TOKEN_STORE_FILE.exists():
+        with TOKEN_STORE_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        file_token = str(data.get("access_token") or "").strip()
+        if file_token:
+            return file_token
+
+        raise ValueError(
+            f"access_token key is missing or empty in {TOKEN_STORE_FILE}"
         )
 
-    with TOKEN_STORE_FILE.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    access_token = str(data.get("access_token") or "").strip()
-    if not access_token:
-        raise ValueError("access_token not found in token_store.json")
-
-    return access_token
+    raise FileNotFoundError(
+        f"Token file not found: {TOKEN_STORE_FILE}. "
+        "Set UPSTOX_ACCESS_TOKEN or provide token_store.json."
+    )
 
 
 def _headers() -> dict[str, str]:
@@ -383,7 +341,9 @@ def health() -> dict[str, Any]:
         "sensex_latest_ts": sensex_latest.get("timestamp"),
         "nifty_error": nifty_latest.get("fetch_error"),
         "sensex_error": sensex_latest.get("fetch_error"),
-        "token_present": bool(os.getenv("UPSTOX_ACCESS_TOKEN", "").strip() or TOKEN_STORE_FILE.exists()),
+        "token_present": bool(
+            os.getenv("UPSTOX_ACCESS_TOKEN", "").strip() or TOKEN_STORE_FILE.exists()
+        ),
     }
 
 
