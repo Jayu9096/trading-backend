@@ -12,6 +12,7 @@ from typing import Any
 import requests
 import uvicorn
 from fastapi import FastAPI
+from pydantic import BaseModel
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -41,8 +42,36 @@ SYMBOL_CONFIG = {
 store = SnapshotStore(max_snapshots=100)
 app = FastAPI(title="Option Chain Collector Service")
 
+_RUNTIME_TOKEN: str | None = None
+_TOKEN_LOCK = threading.Lock()
+
+
+class TokenUpdateRequest(BaseModel):
+    access_token: str
+
+
+def _save_token_file(access_token: str) -> None:
+    try:
+        with TOKEN_STORE_FILE.open("w", encoding="utf-8") as f:
+            json.dump({"access_token": access_token}, f)
+    except Exception:
+        pass
+
+
+def _set_runtime_token(access_token: str, persist_file: bool = True) -> None:
+    global _RUNTIME_TOKEN
+    token = access_token.strip()
+    with _TOKEN_LOCK:
+        _RUNTIME_TOKEN = token
+    if persist_file and token:
+        _save_token_file(token)
+
 
 def _load_access_token() -> str:
+    with _TOKEN_LOCK:
+        if _RUNTIME_TOKEN:
+            return _RUNTIME_TOKEN
+
     env_token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
     if env_token:
         return env_token
@@ -50,11 +79,9 @@ def _load_access_token() -> str:
     if TOKEN_STORE_FILE.exists():
         with TOKEN_STORE_FILE.open("r", encoding="utf-8") as f:
             data = json.load(f)
-
         file_token = str(data.get("access_token") or "").strip()
         if file_token:
             return file_token
-
         raise ValueError(f"access_token key is missing or empty in {TOKEN_STORE_FILE}")
 
     raise FileNotFoundError(
@@ -232,14 +259,7 @@ def _normalize_chain_items(items: list[dict[str, Any]]) -> tuple[list[dict[str, 
         if row_pcr is None and ce_oi:
             row_pcr = round(pe_oi / ce_oi, 2)
 
-        rows.append(
-            {
-                **ce,
-                "STRIKE": strike,
-                "PCR": row_pcr,
-                **pe,
-            }
-        )
+        rows.append({**ce, "STRIKE": strike, "PCR": row_pcr, **pe})
 
     rows.sort(key=lambda x: float(x["STRIKE"]))
     latest_pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi else None
@@ -297,7 +317,6 @@ def _collect_symbol(symbol: str) -> None:
                 "bootstrapped_once": True,
             }
             store.append(symbol, snapshot)
-
         except Exception as exc:
             previous = store.latest(symbol)
             snapshot = {
@@ -339,6 +358,7 @@ def root() -> dict[str, Any]:
         "health_url": "/health",
         "latest_nifty_url": "/latest/NIFTY",
         "latest_sensex_url": "/latest/SENSEX",
+        "update_token_url": "/auth/token",
     }
 
 
@@ -347,7 +367,7 @@ def health() -> dict[str, Any]:
     nifty_latest = store.latest("NIFTY")
     sensex_latest = store.latest("SENSEX")
 
-    token_present = bool(os.getenv("UPSTOX_ACCESS_TOKEN", "").strip() or TOKEN_STORE_FILE.exists())
+    token_present = bool(os.getenv("UPSTOX_ACCESS_TOKEN", "").strip() or TOKEN_STORE_FILE.exists() or _RUNTIME_TOKEN)
     token_valid = False
     auth_message = None
 
@@ -369,6 +389,29 @@ def health() -> dict[str, Any]:
         "token_valid": token_valid,
         "auth_required": not token_valid,
         "auth_message": auth_message,
+    }
+
+
+@app.post("/auth/token")
+def update_token(payload: TokenUpdateRequest) -> dict[str, Any]:
+    token = payload.access_token.strip()
+    if not token:
+        return {"ok": False, "message": "access_token is empty"}
+
+    _set_runtime_token(token, persist_file=True)
+    valid, msg = _check_token_validity()
+
+    if not valid:
+        return {
+            "ok": False,
+            "message": msg or "Token validation failed.",
+            "token_valid": False,
+        }
+
+    return {
+        "ok": True,
+        "message": "Upstox token updated successfully.",
+        "token_valid": True,
     }
 
 
