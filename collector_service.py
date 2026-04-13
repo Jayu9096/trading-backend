@@ -55,9 +55,7 @@ def _load_access_token() -> str:
         if file_token:
             return file_token
 
-        raise ValueError(
-            f"access_token key is missing or empty in {TOKEN_STORE_FILE}"
-        )
+        raise ValueError(f"access_token key is missing or empty in {TOKEN_STORE_FILE}")
 
     raise FileNotFoundError(
         f"Token file not found: {TOKEN_STORE_FILE}. "
@@ -71,6 +69,24 @@ def _headers() -> dict[str, str]:
         "Content-Type": "application/json",
         "Authorization": f"Bearer {_load_access_token()}",
     }
+
+
+def _check_token_validity() -> tuple[bool, str | None]:
+    try:
+        url = f"{BASE_URL}/market-quote/ohlc"
+        params = {
+            "instrument_key": "NSE_INDEX|Nifty 50",
+            "interval": "1d",
+        }
+        response = requests.get(url, headers=_headers(), params=params, timeout=HTTP_TIMEOUT)
+
+        if response.status_code == 401:
+            return False, "Upstox token is invalid or expired."
+
+        response.raise_for_status()
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
 
 
 def _safe_float(value: Any, default: float | None = None) -> float | None:
@@ -280,7 +296,6 @@ def _collect_symbol(symbol: str) -> None:
                 "fetch_error": None if rows else "Option chain returned no rows.",
                 "bootstrapped_once": True,
             }
-
             store.append(symbol, snapshot)
 
         except Exception as exc:
@@ -332,6 +347,15 @@ def health() -> dict[str, Any]:
     nifty_latest = store.latest("NIFTY")
     sensex_latest = store.latest("SENSEX")
 
+    token_present = bool(os.getenv("UPSTOX_ACCESS_TOKEN", "").strip() or TOKEN_STORE_FILE.exists())
+    token_valid = False
+    auth_message = None
+
+    if token_present:
+        token_valid, auth_message = _check_token_validity()
+    else:
+        auth_message = "Upstox token is missing."
+
     return {
         "ok": True,
         "symbols": store.symbols(),
@@ -341,9 +365,10 @@ def health() -> dict[str, Any]:
         "sensex_latest_ts": sensex_latest.get("timestamp"),
         "nifty_error": nifty_latest.get("fetch_error"),
         "sensex_error": sensex_latest.get("fetch_error"),
-        "token_present": bool(
-            os.getenv("UPSTOX_ACCESS_TOKEN", "").strip() or TOKEN_STORE_FILE.exists()
-        ),
+        "token_present": token_present,
+        "token_valid": token_valid,
+        "auth_required": not token_valid,
+        "auth_message": auth_message,
     }
 
 
